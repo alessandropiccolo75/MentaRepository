@@ -15,7 +15,7 @@ const client = new pg.Client({ connectionString: process.env.DATABASE_URL_UNPOOL
 await client.connect();
 try {
   await client.query("set lock_timeout = '60s'");
-  await client.query("select pg_advisory_lock(7272741)");
+  await client.query("select pg_advisory_lock(7272741::bigint)");
   await client.query(
     "create table if not exists schema_migrations (name text primary key, applied_at timestamptz not null default now())",
   );

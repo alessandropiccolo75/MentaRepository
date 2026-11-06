@@ -1,11 +1,14 @@
 import { readdir, readFile, mkdir } from "node:fs/promises";
+import { join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import pg from "pg";
+import { dbCode } from "@/lib/errors";
 
 pg.types.setTypeParser(1082, (value) => value);
 
 const databaseUrl = process.env.DATABASE_URL?.trim() ?? "";
 let pool: pg.Pool | undefined;
+let remoteReady: Promise<void> | undefined;
 let local: Promise<PGlite> | undefined;
 let queue: Promise<void> = Promise.resolve();
 
@@ -22,8 +25,8 @@ function enqueue<T>(fn: () => Promise<T>): Promise<T> {
 
 export async function sql<T = Record<string, unknown>>(text: string, params: unknown[] = []): Promise<T[]> {
   if (databaseUrl !== "") {
-    pool ??= new pg.Pool({ connectionString: databaseUrl, max: 5, statement_timeout: 15000 });
-    return (await pool.query(text, params)).rows as T[];
+    const current = await ensureRemote();
+    return (await current.query(text, params)).rows as T[];
   }
   return enqueue(async () => {
     const db = await getLocal();
@@ -33,8 +36,8 @@ export async function sql<T = Record<string, unknown>>(text: string, params: unk
 
 export async function withTransaction<T>(fn: (q: Query) => Promise<T>): Promise<T> {
   if (databaseUrl !== "") {
-    pool ??= new pg.Pool({ connectionString: databaseUrl, max: 5, statement_timeout: 15000 });
-    const client = await pool.connect();
+    const current = await ensureRemote();
+    const client = await current.connect();
     try {
       await client.query("begin");
       const q: Query = async (text, params = []) => (await client.query(text, params)).rows as never;
@@ -70,6 +73,86 @@ export async function withTransaction<T>(fn: (q: Query) => Promise<T>): Promise<
       throw error;
     }
   });
+}
+
+function getPool(): pg.Pool {
+  // statement_timeout is a startup parameter. The hosted pooler rejects it and
+  // every query fails, so the limit stays off this connection.
+  pool ??= new pg.Pool({ connectionString: databaseUrl, max: 5 });
+  return pool;
+}
+
+async function ensureRemote(): Promise<pg.Pool> {
+  const current = getPool();
+  remoteReady ??= applyRemoteMigrations(current).catch((error: unknown) => {
+    remoteReady = undefined;
+    console.error(`assegna:db:${error instanceof Error ? error.name : "Error"}:${dbCode(error)}`);
+    throw error;
+  });
+  await remoteReady;
+  return current;
+}
+
+async function migrationFiles(): Promise<{ name: string; sql: string }[]> {
+  const dir = join(process.cwd(), "migrations");
+  const names = (await readdir(dir).catch(() => [])).filter((file) => file.endsWith(".sql")).sort();
+  const files: { name: string; sql: string }[] = [];
+  for (const name of names) files.push({ name, sql: await readFile(join(dir, name), "utf8") });
+  return files;
+}
+
+async function applyRemoteMigrations(current: pg.Pool): Promise<void> {
+  const probe = await current.query<{ name: string | null }>("select to_regclass('public.users') as name");
+  if (probe.rows[0]?.name) return;
+  const files = await migrationFiles();
+  if (files.length === 0) {
+    console.error("assegna:db:migrations-missing");
+    return;
+  }
+  const client = new pg.Client({
+    connectionString: process.env.DATABASE_URL_UNPOOLED?.trim() || databaseUrl,
+  });
+  await client.connect();
+  try {
+    const again = await client.query<{ name: string | null }>("select to_regclass('public.users') as name");
+    if (again.rows[0]?.name) return;
+    try {
+      await client.query("select pg_advisory_lock(7272741::bigint)");
+    } catch (error) {
+      console.error(`assegna:db:lock:${dbCode(error)}`);
+    }
+    await client.query(
+      "create table if not exists schema_migrations (name text primary key, applied_at timestamptz not null default now())",
+    );
+    const done = new Set(
+      (await client.query<{ name: string }>("select name from schema_migrations")).rows.map((row) => row.name),
+    );
+    for (const file of files) {
+      if (done.has(file.name)) continue;
+      await client.query("begin");
+      try {
+        await client.query(file.sql);
+        await client.query("insert into schema_migrations (name) values ($1)", [file.name]);
+        await client.query("commit");
+      } catch (error) {
+        try {
+          await client.query("rollback");
+        } catch {
+          // Keep the migration error.
+        }
+        const present = await client.query<{ name: string | null }>("select to_regclass('public.users') as name");
+        if (present.rows[0]?.name) return;
+        throw error;
+      }
+    }
+  } finally {
+    try {
+      await client.query("select pg_advisory_unlock(7272741::bigint)");
+    } catch {
+      // Closing the connection releases the lock.
+    }
+    await client.end();
+  }
 }
 
 async function getLocal(): Promise<PGlite> {

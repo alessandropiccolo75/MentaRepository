@@ -63,7 +63,7 @@ export async function upsertViewer(input: { stage: Stage; sub: string; email: st
   const email = input.email.trim().slice(0, 200);
   const name = input.name.trim().slice(0, 120);
   return withTransaction(async (q) => {
-    await q("select pg_advisory_xact_lock(hashtext($1))", [`assegna-bootstrap:${input.stage}`]);
+    await q("select pg_advisory_xact_lock(hashtext($1)::bigint)", [`assegna-bootstrap:${input.stage}`]);
     const groupId = await ensureGroup(q, input.stage, "generale", "Generale");
     const rows = await q<UserRow>(
       `insert into users (stage, identity_sub, email, identity_name, role_id, group_id, last_seen_at)
@@ -308,7 +308,7 @@ export async function removeSampleData(actor: Viewer): Promise<void> {
 
 export async function ensureSampleData(viewer: Viewer): Promise<void> {
   await withTransaction(async (q) => {
-    await q("select pg_advisory_xact_lock(hashtext($1))", [`assegna-seed:${viewer.stage}`]);
+    await q("select pg_advisory_xact_lock(hashtext($1)::bigint)", [`assegna-seed:${viewer.stage}`]);
     const existing = await q("select 1 from app_settings where stage = $1 and key = 'samples_seeded'", [viewer.stage]);
     if (existing.length) return;
     await seedSamples(q, viewer);
@@ -372,7 +372,7 @@ async function seedSamples(q: Query, viewer: Viewer): Promise<void> {
     for (const assignee of input.assignees) {
       await q(
         `insert into task_assignments (stage, task_id, user_id, assigned_by, accepted_at)
-         values ($1, $2, $3, $4, case when $5 then now() - interval '2 days' else null end)`,
+         values ($1, $2, $3, $4, case when $5::boolean then now() - interval '2 days' else null end)`,
         [viewer.stage, id, assignee.id, input.authorId, Boolean(assignee.accepted)],
       );
     }
